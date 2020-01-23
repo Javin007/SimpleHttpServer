@@ -1,4 +1,6 @@
+using DamienG.Security.Cryptography;
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -11,7 +13,14 @@ namespace HttpServer
 {
     class Program
     {
+        static string _guid = "10C20077DAFE49EDA3FBE97A955F2B6E";
         static string _path;
+        static string _hash;
+        private static string _allowedCharacters = @"^[a-zA-Z0-9-_.\/]+$";
+        private static Regex _regEx = new Regex(_allowedCharacters);
+        private static Timer _hashTimer;
+
+        private static Crc32 crc32 = new Crc32();
 
         static void Main(string[] args)
         {
@@ -44,23 +53,38 @@ namespace HttpServer
             }
 
             listener.Start();
+
             (new Thread(() =>
             {
-                Console.WriteLine("Done.");
                 while (listener.IsListening)
                 {
                     HandleRequest(listener.GetContext());
                 }
             })).Start();
+
+            Console.WriteLine("Done.");
+
+            _hashTimer = new Timer(TimerTick, null, 0, 1000);
+
         }
 
-        private static string _allowedCharacters = @"^[a-zA-Z0-9-_.\/]+$";
-        private static Regex _regEx = new Regex(_allowedCharacters);
+        private static void TimerTick(object state)
+        {
+            var hash = GetFileSystemHash();
+            if (_hash != hash)
+            {
+                Console.WriteLine("File system change detected.");
+                _hash = hash;
+            }
+        }
+
         public static bool IsValidRequest(string url)
         {
             if (url.StartsWith(".")) return false;
             if (url.EndsWith(".")) return false;
             if (url.Contains("..")) return false;
+            if (url.Contains("./")) return false;
+            if (url.Contains("/.")) return false;
             if (url.StartsWith("/")) return false;
             if (url.EndsWith("/")) return false;
             if (url.Contains("//")) return false;
@@ -72,10 +96,26 @@ namespace HttpServer
         {
             var request = context.Request;
             var url = Uri.UnescapeDataString(request.RawUrl).Substring(1);
+
+            if (url.StartsWith(_guid))
+            {
+                var split = url.Split('/');
+                if (_hash == split[1])
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.OK;
+                }
+                else
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.Accepted;
+                }
+                context.Response.OutputStream.Close();
+                return;
+            }
+
             if (string.IsNullOrEmpty(url.Trim())) url = "index.htm";
-                       
+
             Console.Write("Request: " + url + " ");
-            
+
             var response = context.Response;
 
             if ((request.HttpMethod.ToUpper() != "GET") || (!IsValidRequest(url)))
@@ -114,6 +154,15 @@ namespace HttpServer
             response.ContentType = contentType;
             response.StatusCode = (int)HttpStatusCode.OK;
             var responseBytes = File.ReadAllBytes(filename);
+            if (filename.EndsWith("\\index.htm")) {
+                var strData = Encoding.UTF8.GetString(responseBytes);
+                var lData = strData.ToLower();
+                var header = lData.IndexOf("</body>");
+                var pre = strData.Substring(0, header);
+                var suff = strData.Substring(header);
+                strData = pre + _injectScript.Replace("pH", _guid + "/" + _hash) + suff;
+                responseBytes = Encoding.UTF8.GetBytes(strData);
+            }
             response.ContentLength64 = responseBytes.Length;
             var output = response.OutputStream;
             output.Write(responseBytes, 0, responseBytes.Length);
@@ -201,6 +250,58 @@ namespace HttpServer
             if (ext == ".7z") return "application/x-7z-compressed";
             return null;
         }
+
+        private static string GetFileSystemHash()
+        {
+            var sb = new StringBuilder();
+            BuildFileList(sb, _path);
+            var bytes = Encoding.ASCII.GetBytes(sb.ToString());
+            sb.Clear();
+            foreach (var b in crc32.ComputeHash(bytes))
+            {
+                sb.Append(b.ToString("x2").ToLower());
+            }
+            return sb.ToString();
+        }
+
+        private static void BuildFileList(StringBuilder sb, string path)
+        {
+            foreach (var file in Directory.GetFiles(path))
+            {
+                var fileName = Path.GetFileName(file);
+                if (fileName.StartsWith(".") || fileName.StartsWith("_")) continue;
+                sb.Append(fileName + "/");
+                var fileInfo = new FileInfo(file);
+                sb.Append(fileInfo.LastWriteTimeUtc.ToString("HHmmss"));
+                sb.Append("|");
+            }
+            foreach (var dir in Directory.GetDirectories(path))
+            {
+                var lastSlash = dir.LastIndexOf("\\") + 1;
+                var dirName = dir.Substring(lastSlash);
+                if (dirName.StartsWith(".") || dirName.StartsWith("_")) continue;
+                sb.Append(dirName);
+                sb.Append("|");
+                BuildFileList(sb, dir);
+            }
+        }
+
+        private static string _injectScript = "<script>setInterval(function(){var e=new XMLHttpRequest(0);e.open(\"GET\",\"pH\"),e.onreadystatechange=(t=>{200!==e.status&&location.reload(!0)}),e.send()},1e3);</script>";
+
+        //private static string _injectScript =
+        //    "		<script>\r\n" +
+        //    "           setInterval(function() {\r\n" +
+        //    "   			var http = new XMLHttpRequest(0);\r\n" +
+        //    "               var url='pH';\r\n" +
+        //    "               http.open(\"GET\", url);\r\n" +
+        //    "			    http.onreadystatechange=(e)=>{\r\n" +
+        //    "   				if (http.status !== 200) {\r\n" +
+        //    "                       //location.reload(true);\r\n" +
+        //    "                   }\r\n" +
+        //    "	    		}\r\n" +
+        //    "		    	http.send();\r\n" +
+        //    "           }, 1000);\r\n" +
+        //    "		</script>";
 
     }
 }
