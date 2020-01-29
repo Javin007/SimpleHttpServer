@@ -1,9 +1,9 @@
-using DamienG.Security.Cryptography;
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.WebSockets;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,16 +13,23 @@ namespace HttpServer
 {
     class Program
     {
-        static string _guid = "10C20077DAFE49EDA3FBE97A955F2B6E";
-        static string _path;
-        static string _hash;
+        private static string[][] _extToType = { new[] { ".htm", "text/html" }, new[] { ".html", "text/html" }, new[] { ".js", "text/javascript" }, new[] { ".css", "text/css" }, new[] { ".ico", "image/vnd.microsoft.icon" }, new[] { ".jpg", "image/jpeg" }, new[] { ".jpeg", "image/jpeg" }, new[] { ".png", "image/png" }, new[] { ".gif", "image/gif" }, new[] { ".bmp", "image/bmp" }, new[] { ".json", "application/json" }, new[] { ".svg", "image/svg+xml" }, new[] { ".tif", "image/tiff" }, new[] { ".tiff", "image/tiff" }, new[] { ".swf", "application/x-shockwave-flash" }, new[] { ".map", "text/javascript" }, new[] { ".aac", "audio/aac" }, new[] { ".abw", "application/x-abiword" }, new[] { ".arc", "application/x-freearc" }, new[] { ".avi", "video/x-msvideo" }, new[] { ".azw", "application/vnd.amazon.ebook" }, new[] { ".bin", "application/octet-stream" }, new[] { ".bz", "application/x-bzip" }, new[] { ".bz2", "application/x-bzip2" }, new[] { ".csh", "application/x-csh" }, new[] { ".csv", "text/csv" }, new[] { ".doc", "application/msword" }, new[] { ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }, new[] { ".eot", "application/vnd.ms-fontobject" }, new[] { ".epub", "application/epub+zip" }, new[] { ".gz", "application/gzip" }, new[] { ".ics", "text/calendar" }, new[] { ".jar", "application/java-archive" }, new[] { ".jsonld", "application/ld+json" }, new[] { ".mid", "audio/midi audio/x-midi" }, new[] { ".midi", "audio/midi audio/x-midi" }, new[] { ".mjs", "text/javascript" }, new[] { ".mp3", "audio/mpeg" }, new[] { ".mpeg", "video/mpeg" }, new[] { ".mpkg", "application/vnd.apple.installer+xml" }, new[] { ".odp", "application/vnd.oasis.opendocument.presentation" }, new[] { ".ods", "application/vnd.oasis.opendocument.spreadsheet" }, new[] { ".odt", "application/vnd.oasis.opendocument.text" }, new[] { ".oga", "audio/ogg" }, new[] { ".ogv", "video/ogg" }, new[] { ".ogx", "application/ogg" }, new[] { ".opus", "audio/opus" }, new[] { ".otf", "font/otf" }, new[] { ".pdf", "application/pdf" }, new[] { ".ppt", "application/vnd.ms-powerpoint" }, new[] { ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, new[] { ".rar", "application/x-rar-compressed" }, new[] { ".rtf", "application/rtf" }, new[] { ".sh", "application/x-sh" }, new[] { ".tar", "application/x-tar" }, new[] { ".ts", "video/mp2t" }, new[] { ".ttf", "font/ttf" }, new[] { ".txt", "text/plain" }, new[] { ".vsd", "application/vnd.visio" }, new[] { ".wav", "audio/wav" }, new[] { ".weba", "audio/webm" }, new[] { ".webm", "video/webm" }, new[] { ".webp", "image/webp" }, new[] { ".woff", "font/woff" }, new[] { ".woff2", "font/woff2" }, new[] { ".xhtml", "application/xhtml+xml" }, new[] { ".xls", "application/vnd.ms-excel" }, new[] { ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }, new[] { ".xml", "application/xml" }, new[] { ".xul", "application/vnd.mozilla.xul+xml" }, new[] { ".zip", "application/zip" }, new[] { ".3gp", "video/3gpp" }, new[] { ".3g2", "video/3gpp2" }, new[] { ".7z", "application/x-7z-compressed" } };
+        private static string _injectScript = "<script>new WebSocket(\"ws://localhost:80/\").onmessage=function(o){location.reload(!0)};</script>";
+        private static string _path;
+
         private static string _allowedCharacters = @"^[a-zA-Z0-9-_.\/]+$";
         private static Regex _regEx = new Regex(_allowedCharacters);
+        private static CancellationTokenSource SocketLoopTokenSource;
+        private static CancellationTokenSource SocketSendTokenSource = new CancellationTokenSource();
+        private static CancellationToken SendCancel = SocketSendTokenSource.Token;
+
+        private static object _listLock = new object();
+        private static LinkedList<WebSocket> _webSockets = new LinkedList<WebSocket>();
         private static Timer _hashTimer;
+        private static LinkedList<string> _hash = new LinkedList<string>();
+        private static ArraySegment<byte> FilesChanged = new ArraySegment<byte>(Encoding.UTF8.GetBytes("FilesChanged"));
 
-        private static Crc32 crc32 = new Crc32();
-
-        static void Main(string[] args)
+        public static void Main(string[] args)
         {
             var prefixes = new string[] { "http://*:80/" };
             var listener = new HttpListener();
@@ -39,7 +46,7 @@ namespace HttpServer
             if (!_path.EndsWith("\\")) _path += "\\";
 
             var msg = new StringBuilder();
-            msg.Append("Mapping: ");
+            msg.Append("Mapping HTTP: ");
             msg.Append(string.Join(", ", prefixes));
             msg.Append(" to \"");
             msg.Append(_path);
@@ -58,27 +65,43 @@ namespace HttpServer
             {
                 while (listener.IsListening)
                 {
-                    HandleRequest(listener.GetContext());
+                    var context = listener.GetContext();
+                    if (context.Request.IsWebSocketRequest)
+                    {
+                        HandleWebSocketRequest(context);
+                    }
+                    else
+                    {
+                        HandleHttpRequest(context);
+                    }
                 }
             })).Start();
 
             Console.WriteLine("Done.");
 
-            _hashTimer = new Timer(TimerTick, null, 0, 1000);
+            _hashTimer = new Timer(TimerTick, null, 0, 500);
 
         }
+
 
         private static void TimerTick(object state)
         {
             var hash = GetFileSystemHash();
-            if (_hash != hash)
+            if (!Enumerable.SequenceEqual(_hash, hash))
             {
                 Console.WriteLine("File system change detected.");
                 _hash = hash;
+                lock (_listLock)
+                {
+                    foreach (var socket in _webSockets)
+                    {
+                        socket.SendAsync(FilesChanged, WebSocketMessageType.Text, true, SendCancel);
+                    }
+                }
             }
         }
 
-        public static bool IsValidRequest(string url)
+        public static bool IsValidHttpRequest(string url)
         {
             if (url.StartsWith(".")) return false;
             if (url.EndsWith(".")) return false;
@@ -92,25 +115,60 @@ namespace HttpServer
             return (matches.Groups.Count == 1);
         }
 
-        private static void HandleRequest(HttpListenerContext context)
+        private static void HandleWebSocketRequest(HttpListenerContext context)
+        {
+            var webSocket = context.AcceptWebSocketAsync(null).Result.WebSocket;
+            var thr = new Thread(WebSocketHandler);
+            thr.Start(webSocket);
+        }
+
+        private static void WebSocketHandler(object socket)
+        {
+            var context = (WebSocket)socket;
+            LinkedListNode<WebSocket> myNode;
+            lock (_listLock)
+            {
+                myNode = _webSockets.AddLast(context);
+            }
+            var bytes = new byte[1024 * 4];
+            var buffer = new ArraySegment<byte>(bytes, 0, 1024 * 4);
+            SocketLoopTokenSource = new CancellationTokenSource();
+            var killThisShit = SocketLoopTokenSource.Token;
+            while (context.State == WebSocketState.Open && !killThisShit.IsCancellationRequested)
+            {
+                var taskResult = context.ReceiveAsync(buffer, killThisShit);
+                try
+                {
+                    taskResult.Wait();
+                    var result = Encoding.UTF8.GetString(bytes, 0, taskResult.Result.Count);
+                    if (!string.IsNullOrEmpty(result)) Console.WriteLine("WebSocket: " + result);
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                    lock (_listLock)
+                    {
+                        try
+                        {
+                            _webSockets.Remove(myNode);
+                        }
+                        catch (Exception f)
+                        {
+                            Console.WriteLine(f);
+                        }
+
+                    }
+                    Console.WriteLine("WebSocket Closed remotely...");
+                }
+
+            }
+            Console.WriteLine("Socket closed.");
+        }
+
+        private static void HandleHttpRequest(HttpListenerContext context)
         {
             var request = context.Request;
             var url = Uri.UnescapeDataString(request.RawUrl).Substring(1);
-
-            if (url.StartsWith(_guid))
-            {
-                var split = url.Split('/');
-                if (_hash == split[1])
-                {
-                    context.Response.StatusCode = (int)HttpStatusCode.OK;
-                }
-                else
-                {
-                    context.Response.StatusCode = (int)HttpStatusCode.Accepted;
-                }
-                context.Response.OutputStream.Close();
-                return;
-            }
 
             if (string.IsNullOrEmpty(url.Trim())) url = "index.htm";
 
@@ -118,7 +176,7 @@ namespace HttpServer
 
             var response = context.Response;
 
-            if ((request.HttpMethod.ToUpper() != "GET") || (!IsValidRequest(url)))
+            if ((request.HttpMethod.ToUpper() != "GET") || (!IsValidHttpRequest(url)))
             {
                 Console.WriteLine("(Bad Request)");
                 response.StatusCode = (int)HttpStatusCode.BadRequest;
@@ -141,7 +199,7 @@ namespace HttpServer
                 return;
             }
 
-            var contentType = GetContentType(Path.GetExtension(filename).ToLower());
+            var contentType = _extToType.FirstOrDefault(e => e[0] == Path.GetExtension(filename).ToLower());
             if (contentType == null)
             {
                 Console.WriteLine("(Forbidden)");
@@ -151,16 +209,17 @@ namespace HttpServer
             }
 
             Console.WriteLine("(OK)");
-            response.ContentType = contentType;
+            response.ContentType = contentType[1];
             response.StatusCode = (int)HttpStatusCode.OK;
             var responseBytes = File.ReadAllBytes(filename);
-            if (filename.EndsWith("\\index.htm")) {
+            if (filename.EndsWith("\\index.htm"))
+            {
                 var strData = Encoding.UTF8.GetString(responseBytes);
                 var lData = strData.ToLower();
                 var header = lData.IndexOf("</body>");
                 var pre = strData.Substring(0, header);
                 var suff = strData.Substring(header);
-                strData = pre + _injectScript.Replace("pH", _guid + "/" + _hash) + suff;
+                strData = pre + _injectScript + suff;
                 responseBytes = Encoding.UTF8.GetBytes(strData);
             }
             response.ContentLength64 = responseBytes.Length;
@@ -170,138 +229,32 @@ namespace HttpServer
 
         }
 
-        private static string GetContentType(string ext)
+        private static LinkedList<string> GetFileSystemHash()
         {
-            if (ext == ".htm") return "text/html";
-            if (ext == ".html") return "text/html";
-            if (ext == ".js") return "text/javascript";
-            if (ext == ".css") return "text/css";
-            if (ext == ".ico") return "image/vnd.microsoft.icon";
-            if (ext == ".jpg") return "image/jpeg";
-            if (ext == ".jpeg") return "image/jpeg";
-            if (ext == ".png") return "image/png";
-            if (ext == ".gif") return "image/gif";
-            if (ext == ".bmp") return "image/bmp";
-            if (ext == ".json") return "application/json";
-            if (ext == ".svg") return "image/svg+xml";
-            if (ext == ".tif") return "image/tiff";
-            if (ext == ".tiff") return "image/tiff";
-            if (ext == ".swf") return "application/x-shockwave-flash";
-            if (ext == ".map") return "text/javascript";
-
-            if (ext == ".aac") return "audio/aac";
-            if (ext == ".abw") return "application/x-abiword";
-            if (ext == ".arc") return "application/x-freearc";
-            if (ext == ".avi") return "video/x-msvideo";
-            if (ext == ".azw") return "application/vnd.amazon.ebook";
-            if (ext == ".bin") return "application/octet-stream";
-            if (ext == ".bz") return "application/x-bzip";
-            if (ext == ".bz2") return "application/x-bzip2";
-            if (ext == ".csh") return "application/x-csh";
-            if (ext == ".csv") return "text/csv";
-            if (ext == ".doc") return "application/msword";
-            if (ext == ".docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-            if (ext == ".eot") return "application/vnd.ms-fontobject";
-            if (ext == ".epub") return "application/epub+zip";
-            if (ext == ".gz") return "application/gzip";
-            if (ext == ".ics") return "text/calendar";
-            if (ext == ".jar") return "application/java-archive";
-            if (ext == ".jsonld") return "application/ld+json";
-            if (ext == ".mid") return "audio/midi audio/x-midi";
-            if (ext == ".midi") return "audio/midi audio/x-midi";
-            if (ext == ".mjs") return "text/javascript";
-            if (ext == ".mp3") return "audio/mpeg";
-            if (ext == ".mpeg") return "video/mpeg";
-            if (ext == ".mpkg") return "application/vnd.apple.installer+xml";
-            if (ext == ".odp") return "application/vnd.oasis.opendocument.presentation";
-            if (ext == ".ods") return "application/vnd.oasis.opendocument.spreadsheet";
-            if (ext == ".odt") return "application/vnd.oasis.opendocument.text";
-            if (ext == ".oga") return "audio/ogg";
-            if (ext == ".ogv") return "video/ogg";
-            if (ext == ".ogx") return "application/ogg";
-            if (ext == ".opus") return "audio/opus";
-            if (ext == ".otf") return "font/otf";
-            if (ext == ".pdf") return "application/pdf";
-            // if (ext == ".php") return "application/php";
-            if (ext == ".ppt") return "application/vnd.ms-powerpoint";
-            if (ext == ".pptx") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-            if (ext == ".rar") return "application/x-rar-compressed";
-            if (ext == ".rtf") return "application/rtf";
-            if (ext == ".sh") return "application/x-sh";
-            if (ext == ".tar") return "application/x-tar";
-            if (ext == ".ts") return "video/mp2t";
-            if (ext == ".ttf") return "font/ttf";
-            if (ext == ".txt") return "text/plain";
-            if (ext == ".vsd") return "application/vnd.visio";
-            if (ext == ".wav") return "audio/wav";
-            if (ext == ".weba") return "audio/webm";
-            if (ext == ".webm") return "video/webm";
-            if (ext == ".webp") return "image/webp";
-            if (ext == ".woff") return "font/woff";
-            if (ext == ".woff2") return "font/woff2";
-            if (ext == ".xhtml") return "application/xhtml+xml";
-            if (ext == ".xls") return "application/vnd.ms-excel";
-            if (ext == ".xlsx") return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-            if (ext == ".xml") return "application/xml";
-            if (ext == ".xul") return "application/vnd.mozilla.xul+xml";
-            if (ext == ".zip") return "application/zip";
-            if (ext == ".3gp") return "video/3gpp";
-            if (ext == ".3g2") return "video/3gpp2";
-            if (ext == ".7z") return "application/x-7z-compressed";
-            return null;
+            var hash = new LinkedList<string>();
+            BuildFileList(hash, _path);
+            return hash;
         }
 
-        private static string GetFileSystemHash()
-        {
-            var sb = new StringBuilder();
-            BuildFileList(sb, _path);
-            var bytes = Encoding.ASCII.GetBytes(sb.ToString());
-            sb.Clear();
-            foreach (var b in crc32.ComputeHash(bytes))
-            {
-                sb.Append(b.ToString("x2").ToLower());
-            }
-            return sb.ToString();
-        }
-
-        private static void BuildFileList(StringBuilder sb, string path)
+        private static void BuildFileList(LinkedList<string> hash, string path)
         {
             foreach (var file in Directory.GetFiles(path))
             {
                 var fileName = Path.GetFileName(file);
                 if (fileName.StartsWith(".") || fileName.StartsWith("_")) continue;
-                sb.Append(fileName + "/");
+                hash.AddLast(fileName);
                 var fileInfo = new FileInfo(file);
-                sb.Append(fileInfo.LastWriteTimeUtc.ToString("HHmmss"));
-                sb.Append("|");
+                hash.AddLast(fileInfo.LastWriteTimeUtc.ToString("HHmmss"));
             }
             foreach (var dir in Directory.GetDirectories(path))
             {
                 var lastSlash = dir.LastIndexOf("\\") + 1;
                 var dirName = dir.Substring(lastSlash);
                 if (dirName.StartsWith(".") || dirName.StartsWith("_")) continue;
-                sb.Append(dirName);
-                sb.Append("|");
-                BuildFileList(sb, dir);
+                hash.AddLast(dirName);
+                BuildFileList(hash, dir);
             }
         }
-
-        private static string _injectScript = "<script>setInterval(function(){var e=new XMLHttpRequest(0);e.open(\"GET\",\"pH\"),e.onreadystatechange=(t=>{200!==e.status&&location.reload(!0)}),e.send()},1e3);</script>";
-
-        //private static string _injectScript =
-        //    "		<script>\r\n" +
-        //    "           setInterval(function() {\r\n" +
-        //    "   			var http = new XMLHttpRequest(0);\r\n" +
-        //    "               var url='pH';\r\n" +
-        //    "               http.open(\"GET\", url);\r\n" +
-        //    "			    http.onreadystatechange=(e)=>{\r\n" +
-        //    "   				if (http.status !== 200) {\r\n" +
-        //    "                       //location.reload(true);\r\n" +
-        //    "                   }\r\n" +
-        //    "	    		}\r\n" +
-        //    "		    	http.send();\r\n" +
-        //    "           }, 1000);\r\n" +
-        //    "		</script>";
-
     }
+
 }
